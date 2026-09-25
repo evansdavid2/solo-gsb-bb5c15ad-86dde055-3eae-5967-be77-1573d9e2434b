@@ -372,8 +372,14 @@ def test_concurrent_writes_during_query_use_single_snapshot(
     reader = connect(db_path)
     writer = connect(db_path)
 
-    # 在「读数已读出、事件与当前位置尚未读取」的窗口由另一连接并发提交
+    # 在「读数已读出、事件与当前位置尚未读取」的窗口由另一连接并发提交;
+    # 只触发一次:下一次查询(重取快照)时不再重复提交同一批写入
+    fired = {"done": False}
+
     def _concurrent_commit():
+        if fired["done"]:
+            return
+        fired["done"] = True
         writer.execute("BEGIN IMMEDIATE")
         writer.execute(
             "INSERT INTO location_transfers (transfer_no, operator, payload)"

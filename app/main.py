@@ -599,7 +599,8 @@ def open_recall(
     "/api/v1/recalls",
     response_model=s.RecallListResponse,
     tags=["样品召回"],
-    summary="召回单列表(可按 status=active/closed 过滤),各单附当前实时受影响样品",
+    summary="召回单列表(可按 status=active/closed 过滤),各单附当前实时受影响样品;"
+            "总数/分页行/受影响样品取自同一 SQLite 只读快照,避免并发混读",
 )
 def list_recalls(
     status: Optional[str] = Query(default=None, pattern="^(active|closed)$"),
@@ -630,7 +631,8 @@ def get_affected_samples(
     "/api/v1/recalls/{recall_no}",
     response_model=s.RecallResult,
     tags=["样品召回"],
-    summary="按召回号查询召回单及当前实时受影响样品(幂等回放内容)",
+    summary="按召回号查询召回单及当前实时受影响样品(幂等回放内容;"
+            "召回头与受影响样品取自同一 SQLite 只读快照,避免并发混读)",
 )
 def get_recall(
     recall_no: str,

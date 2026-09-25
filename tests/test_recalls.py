@@ -474,3 +474,123 @@ def test_recall_tables_created_on_old_database(tmp_path):
     closed = rcl.close_recall(conn, "RC-1")
     assert closed.status == "closed"
     conn.close()
+
+
+# ---------------------------------------------------------------- 只读快照(并发混读回归)
+
+@pytest.fixture()
+def file_client(tmp_path):
+    """文件库 + 每请求独立连接(贴近真实部署),支持跨连接并发读写。"""
+    db_path = str(tmp_path / "recalls.db")
+
+    def _override():
+        conn = connect(db_path)
+        try:
+            init_db(conn)
+            yield conn
+        finally:
+            conn.close()
+
+    app.dependency_overrides[get_conn] = _override
+    with TestClient(app) as c:
+        c.db_path = db_path  # type: ignore[attr-defined]
+        yield c
+    app.dependency_overrides.clear()
+
+
+def _concurrent_write(db_path):
+    """另一连接提交:追加谱系边 S0 -> A1,并对 S0 新开启召回 RC-2。"""
+    from app import recalls as rcl
+    from app import service
+    from app.schemas import AliquotOp, AliquotPart, RecallRequest
+
+    w = connect(db_path)
+    try:
+        service.submit_batch(w, [AliquotOp(
+            type="aliquot", op_no="OP-CONCURRENT", parent_id="S0",
+            outputs=[AliquotPart(sample_id="A1", amount=10)],
+        )], index_conflicts=False)
+        rcl.open_recall(w, RecallRequest(
+            recall_no="RC-2", source_sample_id="S0", reason="并发开启",
+        ))
+    finally:
+        w.close()
+
+
+def _spy_children_map(monkeypatch, db_path, fired):
+    """在首次读取谱系边(读快照已建立)时,让另一连接提交并发写入。"""
+    from app import recalls as rcl
+
+    orig = rcl._children_map
+
+    def spy(conn):
+        if not fired["done"]:
+            fired["done"] = True
+            _concurrent_write(db_path)
+        return orig(conn)
+
+    monkeypatch.setattr(rcl, "_children_map", spy)
+
+
+def test_list_recalls_single_snapshot_under_concurrent_write(
+    file_client, monkeypatch
+):
+    """列表查询中途另一请求开启召回并追加谱系边:
+    总数、分页行与各单受影响样品仍来自同一个只读快照。"""
+    client = file_client
+    _sampling(client, "OP-1", "S0", 100)
+    _open_recall(client, "RC-1", "S0")
+
+    fired = {"done": False}
+    _spy_children_map(monkeypatch, client.db_path, fired)
+
+    body = client.get("/api/v1/recalls").json()
+    assert fired["done"]
+    # 快照建立前的状态:只有 RC-1,受影响仅源样品自身
+    assert body["total"] == 1
+    assert [x["recall_no"] for x in body["items"]] == ["RC-1"]
+    assert [a["sample_id"] for a in body["items"][0]["affected_samples"]] == ["S0"]
+
+    # 并发写入完成后的下一次查询(新快照)须反映新状态
+    monkeypatch.undo()
+    body = client.get("/api/v1/recalls").json()
+    assert body["total"] == 2
+    assert [x["recall_no"] for x in body["items"]] == ["RC-1", "RC-2"]
+    assert {a["sample_id"] for a in body["items"][0]["affected_samples"]} == {
+        "S0", "A1",
+    }
+
+
+def test_get_recall_single_snapshot_under_concurrent_write(
+    file_client, monkeypatch
+):
+    """单条查询中途另一请求追加谱系边:召回头与受影响样品仍来自同一快照。"""
+    client = file_client
+    _sampling(client, "OP-1", "S0", 100)
+    _open_recall(client, "RC-1", "S0")
+
+    fired = {"done": False}
+    _spy_children_map(monkeypatch, client.db_path, fired)
+
+    body = client.get("/api/v1/recalls/RC-1").json()
+    assert fired["done"]
+    assert body["status"] == "active"
+    assert [a["sample_id"] for a in body["affected_samples"]] == ["S0"]
+    assert body["affected_count"] == 1
+
+    # 并发写入完成后的下一次查询(新快照)须反映新状态
+    monkeypatch.undo()
+    body = client.get("/api/v1/recalls/RC-1").json()
+    assert {a["sample_id"] for a in body["affected_samples"]} == {"S0", "A1"}
+    assert body["affected_count"] == 2
+
+
+def test_snapshot_released_after_query_error(client):
+    """查询报错时快照被释放:连接不留未结束事务,后续读写照常。"""
+    _sampling(client, "OP-1", "S0", 100)
+    assert client.get("/api/v1/recalls/NOPE").status_code == 404
+    assert not client.db.in_transaction
+    assert client.db.execute("PRAGMA query_only").fetchone()[0] == 0
+    # 后续写入与查询照常
+    _open_recall(client, "RC-1", "S0")
+    assert client.get("/api/v1/recalls/RC-1").json()["status"] == "active"

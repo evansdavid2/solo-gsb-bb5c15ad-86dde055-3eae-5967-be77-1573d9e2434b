@@ -10,6 +10,8 @@
 - 关闭:按召回号把状态置为 closed(幂等:重复关闭返回首次关闭结果)。
 - 核销领用在其原有单事务内逐项检查样品是否受活跃召回影响,
   命中即逐项冲突、整单不扣量;关闭召回后恢复核销(已建预留同样适用)。
+- 列表/单条查询在同一个 SQLite 只读快照(`db.read_only_snapshot`)内
+  读取总数、分页行、召回头与实时受影响样品,并发写入不会造成混读。
 
 幂等
 ----
@@ -23,6 +25,7 @@ import sqlite3
 from typing import Optional
 
 from . import schemas as s
+from .db import read_only_snapshot
 
 _CYCLE_LIMIT = 100000  # 谱系遍历节点上限,防御性保护(谱系本身为 DAG)
 
@@ -278,16 +281,23 @@ def close_recall(
 # ---------------------------------------------------------------- 查询
 
 def get_recall(conn: sqlite3.Connection, recall_no: str) -> s.RecallResult:
-    header = _get_header(conn, recall_no)
-    if header is None:
-        raise RecallError([
-            _conflict(
-                "recall_not_found",
-                f"召回号 {recall_no} 不存在",
-                recall_no=recall_no,
-            )
-        ])
-    return _build_result(conn, header, replayed=False)
+    """按召回号查询召回单及当前实时受影响样品。
+
+    召回头与受影响样品在同一个只读事务快照内读取:查询期间其他请求
+    开启/关闭召回或追加谱系边对本次不可见,响应不会拼接不同数据库版本;
+    每次查询重开快照,已提交的写入在下一次查询照常可见。
+    """
+    with read_only_snapshot(conn):
+        header = _get_header(conn, recall_no)
+        if header is None:
+            raise RecallError([
+                _conflict(
+                    "recall_not_found",
+                    f"召回号 {recall_no} 不存在",
+                    recall_no=recall_no,
+                )
+            ])
+        return _build_result(conn, header, replayed=False)
 
 
 def list_recalls(
@@ -297,20 +307,27 @@ def list_recalls(
     limit: int = 100,
     offset: int = 0,
 ) -> s.RecallListResponse:
-    """召回单列表(可按状态过滤),各单附当前实时受影响样品。"""
+    """召回单列表(可按状态过滤),各单附当前实时受影响样品。
+
+    总数、分页行与各单实时受影响样品在同一个只读事务快照内读取:
+    查询期间其他请求开启/关闭召回或追加谱系边对本次不可见,
+    响应不会拼接不同数据库版本;每次查询重开快照,
+    并发写入完成后的下一次查询即反映新状态。
+    """
     where = "WHERE status = ?" if status in ("active", "closed") else ""
     params: tuple = (status,) if where else ()
-    total = conn.execute(
-        f"SELECT COUNT(*) AS c FROM recalls {where}", params
-    ).fetchone()["c"]
-    rows = conn.execute(
-        f"SELECT * FROM recalls {where} ORDER BY recall_no LIMIT ? OFFSET ?",
-        (*params, limit, offset),
-    ).fetchall()
-    return s.RecallListResponse(
-        total=total,
-        items=[_build_result(conn, r, replayed=False) for r in rows],
-    )
+    with read_only_snapshot(conn):
+        total = conn.execute(
+            f"SELECT COUNT(*) AS c FROM recalls {where}", params
+        ).fetchone()["c"]
+        rows = conn.execute(
+            f"SELECT * FROM recalls {where} ORDER BY recall_no LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        ).fetchall()
+        return s.RecallListResponse(
+            total=total,
+            items=[_build_result(conn, r, replayed=False) for r in rows],
+        )
 
 
 def get_affected_samples(

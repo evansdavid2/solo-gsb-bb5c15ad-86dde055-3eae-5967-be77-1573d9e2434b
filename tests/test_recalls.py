@@ -3,13 +3,14 @@
 覆盖:开启/关闭召回与幂等、活跃召回沿谱系边实时追踪源样品及全部后代
 (分装/合并/合流去重与实时性)、受影响样品查询、核销领用逐项召回拦截与整单回滚
 (命中返回逐项冲突、整单不扣量)、关闭召回后恢复核销(已建预留同样适用)、
-多召回叠加、旧库自动建表。
+多召回叠加、旧库自动建表、并发写入期间列表/详情查询读取同一快照(不混读)。
 """
 from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
 
+from app import recalls as rc
 from app.db import connect, init_db
 from app.main import app, get_conn
 
@@ -473,4 +474,175 @@ def test_recall_tables_created_on_old_database(tmp_path):
     assert [x.sample_id for x in result.affected_samples] == ["S1"]
     closed = rcl.close_recall(conn, "RC-1")
     assert closed.status == "closed"
+    conn.close()
+
+
+# ---------------------------------------------------------------- 并发快照
+
+def _seed_recall_db(db_path: str) -> None:
+    """建库:S1 样品 + 活跃召回 RC-1(源 S1)。"""
+    setup = connect(db_path)
+    init_db(setup)
+    setup.execute(
+        "INSERT INTO samples (sample_id, material, unit, initial_amount,"
+        " remaining, is_root) VALUES ('S1', 'M', 'mL', 100, 100, 1)"
+    )
+    setup.execute(
+        "INSERT INTO recalls (recall_no, source_sample_id, reason, payload)"
+        " VALUES ('RC-1', 'S1', '污染', '{}')"
+    )
+    setup.commit()
+    setup.close()
+
+
+def _writer_append_edge_and_recall(writer) -> None:
+    """并发写入:追加谱系边 S1->S2、开启 RC-2(源 S1)、关闭 RC-1,一次提交。"""
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO samples (sample_id, material, unit, initial_amount,"
+        " remaining, is_root) VALUES ('S2', 'M', 'mL', 50, 50, 0)"
+    )
+    op_id = writer.execute(
+        "INSERT INTO operations (op_no, op_type, payload, effect, seq_index)"
+        " VALUES ('OP-X', 'aliquot', '{}', '{}', 0)"
+    ).lastrowid
+    writer.execute(
+        "INSERT INTO lineage_edges (parent_id, child_id, op_id, amount,"
+        " unit, ref_no) VALUES ('S1', 'S2', ?, 10, 'mL', 'OP-X')",
+        (op_id,),
+    )
+    writer.execute(
+        "INSERT INTO recalls (recall_no, source_sample_id, reason, payload)"
+        " VALUES ('RC-2', 'S1', '污染', '{}')"
+    )
+    writer.execute(
+        "UPDATE recalls SET status = 'closed',"
+        " closed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')"
+        " WHERE recall_no = 'RC-1'"
+    )
+    writer.execute("COMMIT")
+
+
+def test_list_recalls_reads_single_snapshot_under_concurrent_writes(
+    tmp_path, monkeypatch,
+):
+    """列表查询读到总数/分页行之后、算各单受影响样品之前,另一连接提交
+    开召回/关召回/追加谱系边:整次响应必须取自同一只读快照(旧版本),
+    不得拼接跨版本数据;下一次查询则反映新状态。
+    """
+    db_path = str(tmp_path / "snap.db")
+    _seed_recall_db(db_path)
+    reader = connect(db_path)
+    writer = connect(db_path)
+
+    # reader 的快照在事务内首次读(COUNT)时建立;包装受影响样品计算,
+    # 在其首次执行前(总数与分页行已读出后)先完成并发提交
+    original_affected = rc._affected_for
+    committed = False
+
+    def patched_affected(conn, header):
+        nonlocal committed
+        if not committed:
+            committed = True
+            _writer_append_edge_and_recall(writer)
+        return original_affected(conn, header)
+
+    monkeypatch.setattr(rc, "_affected_for", patched_affected)
+
+    try:
+        resp = rc.list_recalls(reader)
+    finally:
+        # 快照事务必须已结束(reader 不再处于事务中,可直接开启写事务)
+        assert not reader.in_transaction
+        reader.execute("BEGIN IMMEDIATE")
+        reader.execute("ROLLBACK")
+
+    # 快照视角:只有提交前的 RC-1(active,受影响仅 S1)
+    assert resp.total == 1
+    assert [(i.recall_no, i.status) for i in resp.items] == [("RC-1", "active")]
+    assert [a.sample_id for a in resp.items[0].affected_samples] == ["S1"]
+    assert resp.items[0].affected_count == 1
+
+    # 下一次查询重新取快照:并发提交全部可见
+    resp2 = rc.list_recalls(reader)
+    assert resp2.total == 2
+    assert [(i.recall_no, i.status) for i in resp2.items] == [
+        ("RC-1", "closed"), ("RC-2", "active"),
+    ]
+    assert resp2.items[0].affected_samples == []  # 已关闭不再追踪
+    assert [a.sample_id for a in resp2.items[1].affected_samples] == ["S1", "S2"]
+
+    reader.close()
+    writer.close()
+
+
+def test_get_recall_reads_single_snapshot_under_concurrent_writes(
+    tmp_path, monkeypatch,
+):
+    """详情查询读到召回头之后、算实时受影响样品之前,另一连接提交新谱系边:
+    召回头与受影响样品必须取自同一只读快照;下一次查询反映新谱系。
+    """
+    db_path = str(tmp_path / "snap.db")
+    _seed_recall_db(db_path)
+    reader = connect(db_path)
+    writer = connect(db_path)
+
+    original_affected = rc._affected_for
+    committed = False
+
+    def patched_affected(conn, header):
+        nonlocal committed
+        if not committed:
+            committed = True
+            _writer_append_edge_and_recall(writer)
+        return original_affected(conn, header)
+
+    monkeypatch.setattr(rc, "_affected_for", patched_affected)
+
+    try:
+        resp = rc.get_recall(reader, "RC-1")
+    finally:
+        assert not reader.in_transaction
+        reader.execute("BEGIN IMMEDIATE")
+        reader.execute("ROLLBACK")
+
+    # 快照视角:头为 active,谱系边尚未提交 -> 受影响仅 S1
+    assert resp.status == "active"
+    assert [a.sample_id for a in resp.affected_samples] == ["S1"]
+    assert resp.affected_count == 1
+
+    # 下一次查询重新取快照:RC-1 已关闭,不再追踪
+    resp2 = rc.get_recall(reader, "RC-1")
+    assert resp2.status == "closed"
+    assert resp2.affected_samples == []
+    # 新召回 RC-2 沿新谱系边追踪到 S2
+    resp3 = rc.get_recall(reader, "RC-2")
+    assert [a.sample_id for a in resp3.affected_samples] == ["S1", "S2"]
+
+    reader.close()
+    writer.close()
+
+
+def test_recall_query_snapshot_released_on_error(tmp_path, monkeypatch):
+    """列表/详情查询中途异常时只读快照必须回滚释放,连接恢复可写状态。"""
+    db_path = str(tmp_path / "rollback.db")
+    _seed_recall_db(db_path)
+    conn = connect(db_path)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("snapshot boom")
+
+    monkeypatch.setattr(rc, "_affected_for", boom)
+
+    with pytest.raises(RuntimeError, match="snapshot boom"):
+        rc.get_recall(conn, "RC-1")
+    assert not conn.in_transaction
+    assert conn.execute("PRAGMA query_only").fetchone()[0] == 0
+
+    with pytest.raises(RuntimeError, match="snapshot boom"):
+        rc.list_recalls(conn)
+    assert not conn.in_transaction
+    # 快照已释放:连接可直接开启写事务
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute("ROLLBACK")
     conn.close()
